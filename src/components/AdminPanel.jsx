@@ -6,6 +6,40 @@ const supabase = createClient(
   import.meta.env.VITE_SUPABASE_ANON_KEY
 )
 
+// Helpers
+const pad2 = (n) => String(n).padStart(2, '0')
+
+const formatDateDDMMYYYY = (d) => {
+  const dd = pad2(d.getDate())
+  const mm = pad2(d.getMonth() + 1)
+  const yyyy = d.getFullYear()
+  return `${dd}/${mm}/${yyyy}`
+}
+
+const isoToDDMMYYYY = (iso) => {
+  // iso = "YYYY-MM-DD"
+  const [yyyy, mm, dd] = iso.split('-')
+  return `${dd}/${mm}/${yyyy}`
+}
+
+const formatTimeHHMM = (iso) => {
+  const dt = new Date(iso)
+  const hh = pad2(dt.getHours())
+  const mm = pad2(dt.getMinutes())
+  return `${hh}${mm}` // 0809 style
+}
+
+const buildDateRangeDDMMYYYY = (startISO, endISO) => {
+  // startISO/endISO from <input type="date"> => "YYYY-MM-DD"
+  const start = new Date(startISO + 'T00:00:00')
+  const end = new Date(endISO + 'T00:00:00')
+  const out = []
+  for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) {
+    out.push(formatDateDDMMYYYY(d))
+  }
+  return out
+}
+
 export default function AdminPanel({ onLock, onBackToKiosk }) {
   const [employees, setEmployees] = useState([])
   const [showInactive, setShowInactive] = useState(false)
@@ -19,6 +53,7 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
 
   useEffect(() => {
     loadEmployees()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [showInactive])
 
   const loadEmployees = async () => {
@@ -47,7 +82,7 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
   const handleAddEmployee = async (e) => {
     e.preventDefault()
     const trimmedName = newEmployeeName.trim()
-    
+
     if (!trimmedName) {
       alert('Please enter a name')
       return
@@ -74,7 +109,7 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
 
   const handleRename = async (employeeId) => {
     const trimmedName = newName.trim()
-    
+
     if (!trimmedName) {
       alert('Please enter a name')
       return
@@ -138,7 +173,7 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
     try {
       const text = await file.text()
       const lines = text.split('\n').filter(line => line.trim())
-      
+
       let imported = 0
       let errors = 0
 
@@ -183,7 +218,7 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
     }
 
     try {
-      // Get all active employees (sorted alphabetically)
+      // 1) Get all active employees (sorted alphabetically)
       const { data: activeEmployees, error: empError } = await supabase
         .from('employees')
         .select('*')
@@ -194,14 +229,35 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
 
       if (empError) throw empError
 
-      // Handle date range with proper timezone
+      // 2) Build the full date range (so headers include all days even if blank)
+      const allDates = buildDateRangeDDMMYYYY(exportStartDate, exportEndDate)
+
+      // 3) Fetch daily comments in one go (map by employee + work_date)
+      const employeeIds = activeEmployees.map(e => e.id)
+
+      const { data: commentsData, error: commentsError } = await supabase
+        .from('daily_comments')
+        .select('employee_id, work_date, comment')
+        .in('employee_id', employeeIds)
+        .gte('work_date', exportStartDate)
+        .lte('work_date', exportEndDate)
+
+      if (commentsError) throw commentsError
+
+      // Map key: "empId|DD/MM/YYYY" -> comment
+      const commentByEmpDate = {}
+      for (const c of (commentsData || [])) {
+        const dateKey = isoToDDMMYYYY(c.work_date) // IMPORTANT: no Date() parsing here
+        commentByEmpDate[`${c.employee_id}|${dateKey}`] = (c.comment || '')
+      }
+
+      // 4) Handle date range for time_entries query
       const startDate = new Date(exportStartDate + 'T00:00:00')
       const endDate = new Date(exportEndDate + 'T23:59:59')
 
-      // Collect all data organized by employee and date
-      const allDatesSet = new Set()
+      // 5) Collect clock pairs organized by employee and date
       const employeeDataByDate = []
-      
+
       for (const emp of activeEmployees) {
         const { data: entries, error: entriesError } = await supabase
           .from('time_entries')
@@ -214,104 +270,97 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
         if (entriesError) throw entriesError
 
         const pairsByDate = {}
-        
-        // Group pairs by date
+
+        // Group pairs by date (IN + next OUT), forcing Sydney date key
         for (let i = 0; i < entries.length; i += 2) {
           if (entries[i] && entries[i].direction === 'in') {
             const date = new Date(entries[i].created_at)
-            const dateKey = date.toLocaleDateString('en-AU', { 
-              day: '2-digit', 
-              month: '2-digit', 
-              year: 'numeric' 
+            const dateKey = date.toLocaleDateString('en-AU', {
+              day: '2-digit',
+              month: '2-digit',
+              year: 'numeric',
+              timeZone: 'Australia/Sydney'
             })
-            
-            allDatesSet.add(dateKey)
-            
+
             if (!pairsByDate[dateKey]) pairsByDate[dateKey] = []
-            
-            const startTime = new Date(entries[i].created_at)
-            const startStr = startTime.toLocaleTimeString('en-AU', { 
-              hour: '2-digit', 
-              minute: '2-digit',
-              hour12: false 
-            }).replace(':', '')
+
+            const startStr = formatTimeHHMM(entries[i].created_at)
 
             let finishStr = ''
             if (entries[i + 1] && entries[i + 1].direction === 'out') {
-              const finishTime = new Date(entries[i + 1].created_at)
-              finishStr = finishTime.toLocaleTimeString('en-AU', { 
-                hour: '2-digit', 
-                minute: '2-digit',
-                hour12: false 
-              }).replace(':', '')
+              finishStr = formatTimeHHMM(entries[i + 1].created_at)
             }
-            
+
             pairsByDate[dateKey].push([startStr, finishStr])
           }
         }
 
-        employeeDataByDate.push({ name: emp.name, pairsByDate })
+        employeeDataByDate.push({ id: emp.id, name: emp.name, pairsByDate })
       }
 
-      // Sort all dates
-      const allDates = Array.from(allDatesSet).sort((a, b) => {
-        const [dayA, monthA, yearA] = a.split('/')
-        const [dayB, monthB, yearB] = b.split('/')
-        return new Date(yearA, monthA - 1, dayA) - new Date(yearB, monthB - 1, dayB)
-      })
+      // 6) FIXED: Always use 2 pairs per date
+      const FIXED_PAIRS_PER_DATE = 2
 
-      // Find max pairs for each date across all employees
-      const maxPairsByDate = {}
-      allDates.forEach(date => {
-        maxPairsByDate[date] = Math.max(
-          ...employeeDataByDate.map(emp => (emp.pairsByDate[date] || []).length),
-          0
-        )
-      })
-
-      // Build headers
+      // 7) Build headers
       const dateHeader = ['employee_name']
-      const inOutHeader = ['']
-      
+      const subHeader = ['']
+
+      // In/Out section - always 2 pairs per date
       allDates.forEach(date => {
-        const pairCount = maxPairsByDate[date]
-        for (let i = 0; i < pairCount; i++) {
+        for (let i = 0; i < FIXED_PAIRS_PER_DATE; i++) {
           dateHeader.push(date, '')
-          inOutHeader.push('In', 'Out')
+          subHeader.push('In', 'Out')
         }
       })
 
-      // Build data rows
+      // Comment section (far right): one per date
+      allDates.forEach(date => {
+        dateHeader.push(date)
+        subHeader.push('Comment')
+      })
+
+      // 8) Build data rows
       const csvData = employeeDataByDate.map(emp => {
         const row = [emp.name]
-        
+
+        // In/Out section - always 2 pairs per date
         allDates.forEach(date => {
           const pairs = emp.pairsByDate[date] || []
-          const maxForDate = maxPairsByDate[date]
-          
-          // Add this employee's pairs for this date
-          pairs.forEach(pair => {
-            row.push(...pair)
-          })
-          
-          // Pad with empty cells if this employee has fewer pairs than max
-          const remaining = maxForDate - pairs.length
-          for (let i = 0; i < remaining; i++) {
-            row.push('', '')
+
+          // Add actual pairs (up to FIXED_PAIRS_PER_DATE)
+          for (let i = 0; i < FIXED_PAIRS_PER_DATE; i++) {
+            if (i < pairs.length) {
+              row.push(...pairs[i])
+            } else {
+              // Fill remaining pairs with empty strings
+              row.push('', '')
+            }
           }
         })
-        
+
+        // Comment section (far right)
+        allDates.forEach(date => {
+          const key = `${emp.id}|${date}`
+          row.push(commentByEmpDate[key] || '')
+        })
+
         return row
       })
 
-      // Generate CSV
+      // 9) Generate CSV (escape commas/quotes/newlines so comments don't break CSV)
+      const escapeCSV = (value) => {
+        const s = String(value ?? '')
+        if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`
+        return s
+      }
+
       const csv = [
-        dateHeader.join(','),
-        inOutHeader.join(','),
-        ...csvData.map(row => row.join(','))
+        dateHeader.map(escapeCSV).join(','),
+        subHeader.map(escapeCSV).join(','),
+        ...csvData.map(row => row.map(escapeCSV).join(','))
       ].join('\n')
 
-      // Download
+      // 10) Download
       const blob = new Blob([csv], { type: 'text/csv' })
       const url = URL.createObjectURL(blob)
       const a = document.createElement('a')
@@ -319,7 +368,6 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
       a.download = `bundy-export-${exportStartDate}-to-${exportEndDate}.csv`
       a.click()
       URL.revokeObjectURL(url)
-
     } catch (error) {
       console.error('Error exporting CSV:', error)
       alert('Failed to export CSV')
@@ -466,8 +514,8 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
                   </td>
                   <td className="px-6 py-4">
                     <span className={`inline-block px-3 py-1 rounded-full text-sm ${
-                      emp.active 
-                        ? 'bg-green-100 text-green-700' 
+                      emp.active
+                        ? 'bg-green-100 text-green-700'
                         : 'bg-gray-100 text-gray-700'
                     }`}>
                       {emp.active ? 'Active' : 'Inactive'}
