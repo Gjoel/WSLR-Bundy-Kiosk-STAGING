@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react'
 import { createClient } from '@supabase/supabase-js'
+import * as XLSX from 'xlsx'
 
 const supabase = createClient(
   import.meta.env.VITE_SUPABASE_URL,
@@ -211,7 +212,7 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
     e.target.value = ''
   }
 
-  const handleExportCSV = async () => {
+  const handleExportXLSX = async () => {
     if (!exportStartDate || !exportEndDate) {
       alert('Please select start and end dates')
       return
@@ -229,10 +230,10 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
 
       if (empError) throw empError
 
-      // 2) Build the full date range (so headers include all days even if blank)
+      // 2) Build the full date range
       const allDates = buildDateRangeDDMMYYYY(exportStartDate, exportEndDate)
 
-      // 3) Fetch daily comments in one go (map by employee + work_date)
+      // 3) Fetch daily comments
       const employeeIds = activeEmployees.map(e => e.id)
 
       const { data: commentsData, error: commentsError } = await supabase
@@ -247,7 +248,7 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
       // Map key: "empId|DD/MM/YYYY" -> comment
       const commentByEmpDate = {}
       for (const c of (commentsData || [])) {
-        const dateKey = isoToDDMMYYYY(c.work_date) // IMPORTANT: no Date() parsing here
+        const dateKey = isoToDDMMYYYY(c.work_date)
         commentByEmpDate[`${c.employee_id}|${dateKey}`] = (c.comment || '')
       }
 
@@ -271,7 +272,7 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
 
         const pairsByDate = {}
 
-        // Group pairs by date (IN + next OUT), forcing Sydney date key
+        // Group pairs by date (IN + next OUT)
         for (let i = 0; i < entries.length; i += 2) {
           if (entries[i] && entries[i].direction === 'in') {
             const date = new Date(entries[i].created_at)
@@ -298,43 +299,65 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
         employeeDataByDate.push({ id: emp.id, name: emp.name, pairsByDate })
       }
 
-      // 6) FIXED: Always use 2 pairs per date
-      const FIXED_PAIRS_PER_DATE = 2
+      // 6) Find max pairs for each date (minimum 2)
+      const maxPairsByDate = {}
+      allDates.forEach(date => {
+        const maxPairs = Math.max(
+          ...employeeDataByDate.map(emp => (emp.pairsByDate[date] || []).length),
+          2  // Minimum 2 pairs
+        )
+        maxPairsByDate[date] = maxPairs
+      })
 
       // 7) Build headers
       const dateHeader = ['employee_name']
       const subHeader = ['']
 
-      // In/Out section - always 2 pairs per date
+      // Track column positions for formatting (so we know which columns are pair 3+)
+      const redColumnRanges = [] // Will store {start: col, end: col} for each red section
+
+      // In/Out section
       allDates.forEach(date => {
-        for (let i = 0; i < FIXED_PAIRS_PER_DATE; i++) {
+        const pairCount = maxPairsByDate[date]
+        for (let i = 0; i < pairCount; i++) {
+          const colStart = dateHeader.length
           dateHeader.push(date, '')
           subHeader.push('In', 'Out')
+          
+          // Mark columns for pair 3+ (index 2+) as needing red formatting
+          if (i >= 2) {
+            redColumnRanges.push({ start: colStart, end: colStart + 1 })
+          }
         }
       })
 
       // Comment section (far right): one per date
+      const commentStartCol = dateHeader.length
       allDates.forEach(date => {
         dateHeader.push(date)
         subHeader.push('Comment')
       })
 
       // 8) Build data rows
-      const csvData = employeeDataByDate.map(emp => {
+      const xlsxData = [dateHeader, subHeader]
+
+      employeeDataByDate.forEach((emp, empIndex) => {
         const row = [emp.name]
 
-        // In/Out section - always 2 pairs per date
+        // In/Out section
         allDates.forEach(date => {
           const pairs = emp.pairsByDate[date] || []
+          const maxForDate = maxPairsByDate[date]
 
-          // Add actual pairs (up to FIXED_PAIRS_PER_DATE)
-          for (let i = 0; i < FIXED_PAIRS_PER_DATE; i++) {
-            if (i < pairs.length) {
-              row.push(...pairs[i])
-            } else {
-              // Fill remaining pairs with empty strings
-              row.push('', '')
-            }
+          // Add all pairs for this date
+          pairs.forEach(pair => {
+            row.push(...pair)
+          })
+
+          // Fill remaining pairs with empty strings
+          const remaining = maxForDate - pairs.length
+          for (let i = 0; i < remaining; i++) {
+            row.push('', '')
           }
         })
 
@@ -344,33 +367,45 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
           row.push(commentByEmpDate[key] || '')
         })
 
-        return row
+        xlsxData.push(row)
       })
 
-      // 9) Generate CSV (escape commas/quotes/newlines so comments don't break CSV)
-      const escapeCSV = (value) => {
-        const s = String(value ?? '')
-        if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`
-        return s
+      // 9) Create workbook and worksheet
+      const wb = XLSX.utils.book_new()
+      const ws = XLSX.utils.aoa_to_sheet(xlsxData)
+
+      // 10) Apply red formatting to 3rd+ pair columns
+      // Red fill: FF0000 (red background) with white text
+      const redStyle = {
+        fill: { fgColor: { rgb: "FFCCCC" } },  // Light red background
+        font: { color: { rgb: "CC0000" }, bold: true }  // Dark red text, bold
       }
 
-      const csv = [
-        dateHeader.map(escapeCSV).join(','),
-        subHeader.map(escapeCSV).join(','),
-        ...csvData.map(row => row.map(escapeCSV).join(','))
-      ].join('\n')
+      // Apply formatting to cells in 3rd+ pair columns
+      if (!ws['!cols']) ws['!cols'] = []
+      if (!ws['!rows']) ws['!rows'] = []
 
-      // 10) Download
-      const blob = new Blob([csv], { type: 'text/csv' })
-      const url = URL.createObjectURL(blob)
-      const a = document.createElement('a')
-      a.href = url
-      a.download = `bundy-export-${exportStartDate}-to-${exportEndDate}.csv`
-      a.click()
-      URL.revokeObjectURL(url)
+      // For each red column range, mark those cells
+      redColumnRanges.forEach(range => {
+        // Apply to data rows (starting from row 2, which is index 2 in the array)
+        for (let rowIdx = 2; rowIdx < xlsxData.length; rowIdx++) {
+          for (let colIdx = range.start; colIdx <= range.end; colIdx++) {
+            const cellAddress = XLSX.utils.encode_cell({ r: rowIdx, c: colIdx })
+            if (!ws[cellAddress]) ws[cellAddress] = { t: 's', v: '' }
+            ws[cellAddress].s = redStyle
+          }
+        }
+      })
+
+      // 11) Add worksheet to workbook
+      XLSX.utils.book_append_sheet(wb, ws, 'Bundy Report')
+
+      // 12) Generate and download
+      XLSX.writeFile(wb, `bundy-export-${exportStartDate}-to-${exportEndDate}.xlsx`)
+
     } catch (error) {
-      console.error('Error exporting CSV:', error)
-      alert('Failed to export CSV')
+      console.error('Error exporting XLSX:', error)
+      alert('Failed to export XLSX')
     }
   }
 
@@ -468,7 +503,7 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
             <p className="text-sm text-gray-600 mb-4">{importStatus}</p>
           )}
 
-          {/* CSV Export */}
+          {/* XLSX Export */}
           <div className="border-t pt-4">
             <h3 className="font-semibold mb-3">Export Report</h3>
             <div className="flex items-center gap-3">
@@ -486,12 +521,15 @@ export default function AdminPanel({ onLock, onBackToKiosk }) {
                 className="px-4 py-2 border rounded-lg"
               />
               <button
-                onClick={handleExportCSV}
+                onClick={handleExportXLSX}
                 className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
               >
-                Export CSV
+                Export XLSX
               </button>
             </div>
+            <p className="text-xs text-gray-500 mt-2">
+              Note: 3rd+ clock in/out pairs will be highlighted in red
+            </p>
           </div>
         </div>
 
